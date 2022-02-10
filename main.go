@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -22,17 +25,45 @@ import (
 const (
 	dbPath          = "testdata/faces.db"
 	defaultPicsPath = "testdata/images/"
-	facesPath       = "testdata/faces/"
 )
 
 var db *sql.DB
+var rec *face.Recognizer
 
 //opencv,dlib
-var defaultMode string
+var defaultMode, facesPath string
+var peoplesName []string
 
 func init() {
-	db, _ = sql.Open("sqlite3", dbPath)
 	defaultMode = "dlib"
+
+	//TODO 把人脸库的数据加载出来,供下面识别用
+	db, _ = sql.Open("sqlite3", dbPath)
+
+	if defaultMode == "dlib" {
+		res, _ := db.Prepare("select Name,Descriptor from t_Portrait where Descriptor<>'' and name <>'' ")
+		rows, _ := res.Query()
+		index := 0
+		var peoplesId []int32
+		var peoplesDescriptor []face.Descriptor
+		for rows.Next() {
+			var Name, Descriptor string
+			rows.Scan(&Name, &Descriptor)
+
+			var faceinfo face.Descriptor
+			dec := gob.NewDecoder(bytes.NewBufferString(Descriptor))
+			dec.Decode(&faceinfo)
+
+			peoplesDescriptor = append(peoplesDescriptor, faceinfo)
+			peoplesName = append(peoplesName, Name)
+			peoplesId = append(peoplesId, int32(index))
+			index += 1
+		}
+
+		//配置dlib
+		rec, _ = face.NewRecognizer("testdata/models/")
+		rec.SetSamples(peoplesDescriptor, peoplesId)
+	}
 }
 
 //go run main.go /{指定目录}
@@ -45,6 +76,7 @@ func main() {
 		dir = os.Args[1]
 	}
 
+	facesPath = dir + "/faces"
 	fmt.Println("开始检测目录:" + dir)
 	rangeDir(dir)
 }
@@ -69,11 +101,10 @@ func rangeDir(dir string) {
 			}
 
 			fmt.Println("start --> ", dir+"/"+fi.Name())
-
-			if defaultMode == "opencv" {
-				findFaceByOPENCV(dir, fi.Name(), fileExt)
-			} else {
+			if defaultMode == "dlib" {
 				findFaceByDLIB(dir, fi.Name(), fileExt)
+			} else {
+				findFaceByOPENCV(dir, fi.Name(), fileExt)
 			}
 		}
 	}
@@ -93,41 +124,41 @@ func findFaceByOPENCV(dir string, fn string, fileExt string) {
 		return
 	}
 
-	// detect faces
 	faces := classifier.DetectMultiScale(img)
 	fmt.Println("faces count: ", len(faces))
 	for i, f := range faces {
-		insertFace(i, f.Min.X, f.Min.Y, f.Max.X, f.Max.Y, dir, fn, fileExt)
+		faceinfo, _ := json.Marshal(f)
+		fmt.Println(string(faceinfo))
+		insertFace(i, f.Min.X, f.Min.Y, f.Max.X, f.Max.Y, dir, fn, fileExt, "")
 	}
 }
 
 func findFaceByDLIB(dir string, fn string, fileExt string) {
-	rec, err := face.NewRecognizer("testdata/models/")
-	if err != nil {
-		fmt.Println("go-face error.")
-		return
-	}
-	defer rec.Close()
-	faces, err := rec.RecognizeFile(dir + "/" + fn)
-	if err != nil {
-		fmt.Println("file recognize error." + fn)
-		return
-	}
-
-	fmt.Println("faces count: ", len(faces))
-	for i, f := range faces {
-		insertFace(i, f.Rectangle.Min.X, f.Rectangle.Min.Y, f.Rectangle.Max.X, f.Rectangle.Max.Y, dir, fn, fileExt)
-	}
-}
-
-func insertFace(i, x0, y0, x1, y1 int, dir, fn, fileExt string) {
 	defer func() {
 		if err := recover(); err != nil {
-			fmt.Println("insertFace error", err)
+			fmt.Println("findFaceByDLIB error", err)
 		}
 	}()
 
-	//peoplesInfo := f.Descriptor
+	faces, _ := rec.RecognizeFile(dir + "/" + fn)
+	fmt.Println("face count:", len(faces))
+	for i, f := range faces {
+		var buff bytes.Buffer
+		enc := gob.NewEncoder(&buff)
+		enc.Encode(f.Descriptor)
+		insertFace(i, f.Rectangle.Min.X, f.Rectangle.Min.Y, f.Rectangle.Max.X, f.Rectangle.Max.Y, dir, fn, fileExt, string(buff.Bytes()))
+
+		//识别出是具体某人
+		if len(peoplesName) > 0 {
+			arrid := rec.Classify(f.Descriptor)
+			if arrid != -1 && len(peoplesName) > arrid {
+				fmt.Println("这人应该是:", peoplesName[arrid])
+			}
+		}
+	}
+}
+
+func insertFace(i, x0, y0, x1, y1 int, dir, fn, fileExt string, faceInfo string) {
 	src := dir + "/" + fn
 	fIn, _ := os.Open(src)
 	defer fIn.Close()
@@ -142,7 +173,7 @@ func insertFace(i, x0, y0, x1, y1 int, dir, fn, fileExt string) {
 	//插入数据
 	newfile, _ := os.Stat(dst)
 	stmt, _ := db.Prepare("INSERT INTO t_Portrait(fullName,fileSize,sourceFile,isCover,isHidden,isDel,Descriptor) values(?,?,?,?,?,?,?)")
-	res, err := stmt.Exec(dst, newfile.Size(), fn, 0, 0, 0, "")
+	res, err := stmt.Exec(dst, newfile.Size(), fn, 0, 0, 0, faceInfo)
 	if err != nil {
 		fmt.Println("DB insert Error.", err, res)
 	}
